@@ -1,0 +1,275 @@
+---
+title: "H-1B Lottery Luck and Next-Year Participation: Industry Heterogeneity"
+subtitle: "Exploratory firm-level analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+## Research question and scope
+
+This notebook asks: **After a luckier H-1B lottery year, do firms apply for
+more or fewer H-1B visas in the following year, and does this relationship vary
+across industries?** It builds directly on the lottery-luck and next-year
+participation analysis, with industry-specific estimates as an exploratory
+extension.
+
+The next-year participation outcomes are observed for the full H-1B employer
+panel. Industry, however, is available only when an employer links to
+Compustat. Since Compustat covers public firms, all industry-specific results
+are limited to this Compustat-matched public-firm subset. They should not be
+read as describing the industry composition or responses of all H-1B employers.
+
+Throughout, “lottery luck” is the firm's selection shock: actual selections
+minus the number expected from the national selection rate in that lottery
+year. The estimates are exploratory heterogeneity results, not proof that the
+causal response differs across industries.
+
+## Load saved data
+
+```{r}
+#| label: packages-and-paths
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(fixest)
+library(broom)
+library(knitr)
+
+options(dplyr.summarise.inform = FALSE)
+theme_set(theme_minimal(base_size = 12))
+
+# Load the saved analysis files from the project's data folder. The fallback
+# supports older checkouts that stored the same files at the project root; no
+# raw data are read or reconstructed in this notebook.
+locate_saved_file <- function(filename) {
+  candidates <- c(file.path("data", filename), filename)
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) {
+    stop("Could not find saved derived input: ", filename, call. = FALSE)
+  }
+  existing[[1]]
+}
+
+participation_path <- locate_saved_file("h1b_lottery_participation_panel.rds")
+firm_year_path <- locate_saved_file("h1b_firm_year_analysis.rds")
+
+# The participation panel supplies the next-year outcomes. The firm-year panel
+# is used only to attach the prepared broad-industry label and match indicator.
+participation <- readRDS(participation_path)
+firm_year <- readRDS(firm_year_path) |>
+  select(ein, lottery_year, sector, compustat_ein_match)
+
+required_participation_variables <- c(
+  "ein", "lottery_year", "n_registrations", "selection_shock",
+  "selection_luck_10pp", "next_year_registrations", "returns_next_year",
+  "log_current_registrations", "log_next_year_registrations"
+)
+stopifnot(all(required_participation_variables %in% names(participation)))
+```
+
+## Full-panel participation and industry coverage
+
+The first table is intentionally based on the full participation panel. It
+shows the scale of the main analysis before restricting to the public-firm
+sample needed to observe industry. The second table reports which industries
+are available after that restriction.
+
+```{r}
+#| label: full-panel-summary
+
+full_participation_summary <- participation |>
+  summarise(
+    firm_years = n(), firms = n_distinct(ein),
+    current_registrations = sum(n_registrations),
+    next_year_registrations = sum(next_year_registrations),
+    returns_next_year_rate = mean(returns_next_year)
+  )
+
+full_participation_summary |>
+  mutate(returns_next_year_rate = scales::percent(returns_next_year_rate, accuracy = 0.1)) |>
+  kable(caption = "Next-year participation panel: full H-1B employer sample")
+
+industry_panel <- participation |>
+  left_join(firm_year, by = c("ein", "lottery_year"))
+
+industry_coverage <- industry_panel |>
+  mutate(industry_coverage = case_when(
+    compustat_ein_match & !is.na(sector) & sector != "Unknown" ~ sector,
+    compustat_ein_match ~ "Matched, industry unavailable",
+    TRUE ~ "Not matched to Compustat"
+  )) |>
+  group_by(industry_coverage) |>
+  summarise(
+    firm_years = n(), firms = n_distinct(ein),
+    current_registrations = sum(n_registrations),
+    next_year_registrations = sum(next_year_registrations),
+    returns_next_year_rate = mean(returns_next_year), .groups = "drop"
+  ) |>
+  arrange(desc(firm_years))
+
+industry_coverage |>
+  mutate(returns_next_year_rate = scales::percent(returns_next_year_rate, accuracy = 0.1)) |>
+  kable(digits = 0, caption = "Industry availability and next-year participation")
+```
+
+## Descriptive participation by industry
+
+These summaries use only Compustat-matched firms with a recorded broad
+industry. The registration measures are counts, because the question is whether
+firms submit more or fewer registrations in the next lottery year—not
+employee-scaled exposure.
+
+```{r}
+#| label: industry-descriptives
+
+industry_sample <- industry_panel |>
+  filter(compustat_ein_match, !is.na(sector), sector != "Unknown")
+
+industry_descriptives <- industry_sample |>
+  group_by(sector) |>
+  summarise(
+    firm_years = n(), firms = n_distinct(ein),
+    current_registrations = sum(n_registrations),
+    next_year_registrations = sum(next_year_registrations),
+    mean_current_registrations = mean(n_registrations),
+    mean_next_year_registrations = mean(next_year_registrations),
+    return_rate = mean(returns_next_year),
+    mean_selection_shock = mean(selection_shock), .groups = "drop"
+  ) |>
+  arrange(desc(current_registrations))
+
+industry_descriptives |>
+  mutate(return_rate = scales::percent(return_rate, accuracy = 0.1)) |>
+  kable(digits = 2, caption = "Descriptive next-year participation by industry")
+```
+
+## Lottery-luck models by industry
+
+The primary outcome is `log(1 + next-year registrations)`, which captures
+whether a firm applies for more or fewer visas while retaining firms with zero
+registrations next year. As a complementary extensive-margin outcome, the
+notebook also estimates whether a firm returns to the lottery at all.
+
+For each industry, the exploratory reduced-form specification is:
+
+\[
+Y_{i,t+1} = \beta_s\,\text{lottery luck}_{it} +
+\gamma\log(1 + \text{current registrations}_{it}) +
+\text{lottery-year fixed effects} + e_{it}.
+\]
+
+Lottery luck is expressed as the firm's selection-rate surprise in 10
+percentage-point units (`selection_luck_10pp`). Standard errors are clustered
+by firm EIN. The current-registration control compares firms with similar
+current H-1B application scale. Sector-specific comparisons remain exploratory.
+
+To avoid reporting extremely small industry cells, a model is shown only if it
+has at least **50 usable firm-years** after all model variables are observed.
+This is a reporting threshold, not a claim that every reported estimate is
+precise.
+
+```{r}
+#| label: model-sample-sizes
+
+minimum_usable_firm_years <- 50L
+outcomes <- c(
+  log_next_year_registrations = "Log(1 + next-year registrations)",
+  returns_next_year = "Returns to lottery next year"
+)
+
+model_ready_counts <- bind_rows(lapply(names(outcomes), function(outcome_name) {
+  industry_sample |>
+    filter(!is.na(.data[[outcome_name]]), !is.na(selection_luck_10pp),
+      !is.na(log_current_registrations)) |>
+    group_by(sector) |>
+    summarise(usable_firm_years = n(), usable_firms = n_distinct(ein),
+      .groups = "drop") |>
+    mutate(outcome = outcomes[[outcome_name]])
+}))
+
+model_ready_counts |>
+  arrange(outcome, desc(usable_firm_years)) |>
+  kable(caption = "Usable observations by industry and outcome")
+```
+
+```{r}
+#| label: estimate-industry-models
+
+estimate_industry_model <- function(data, outcome_name, outcome_label) {
+  estimation_data <- data |>
+    filter(!is.na(.data[[outcome_name]]), !is.na(selection_luck_10pp),
+      !is.na(log_current_registrations))
+  eligible_industries <- estimation_data |>
+    count(sector, name = "n") |>
+    filter(n >= minimum_usable_firm_years) |>
+    pull(sector)
+
+  bind_rows(lapply(eligible_industries, function(industry_name) {
+    industry_data <- filter(estimation_data, sector == industry_name)
+    model <- feols(
+      as.formula(paste0(outcome_name,
+        " ~ selection_luck_10pp + log_current_registrations | lottery_year")),
+      data = industry_data, cluster = ~ein
+    )
+    luck_term <- tidy(model) |> filter(term == "selection_luck_10pp")
+    tibble(
+      outcome = outcome_label, industry = industry_name,
+      firm_years = nobs(model), firms = n_distinct(industry_data$ein),
+      luck_coefficient = luck_term$estimate, std_error = luck_term$std.error,
+      conf_low = luck_term$estimate - 1.96 * luck_term$std.error,
+      conf_high = luck_term$estimate + 1.96 * luck_term$std.error,
+      p_value = luck_term$p.value
+    )
+  }))
+}
+
+industry_model_results <- bind_rows(lapply(names(outcomes), function(outcome_name) {
+  estimate_industry_model(industry_sample, outcome_name, outcomes[[outcome_name]])
+})) |>
+  arrange(outcome, desc(luck_coefficient))
+
+industry_model_results |>
+  mutate(across(c(luck_coefficient, std_error, conf_low, conf_high), ~ round(.x, 3)),
+    p_value = signif(p_value, 3)) |>
+  kable(caption = paste0("Industry-specific lottery-luck estimates; industries require at least ",
+    minimum_usable_firm_years, " usable firm-years"))
+```
+
+```{r}
+#| label: industry-coefficient-plot
+#| fig-cap: "Exploratory lottery-luck estimates by industry, with 95% confidence intervals"
+#| fig-width: 10
+#| fig-height: 6
+
+coefficient_plot <- ggplot(industry_model_results,
+  aes(x = luck_coefficient, y = reorder(industry, luck_coefficient))) +
+  geom_vline(xintercept = 0, color = "grey55", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf_low, xmax = conf_high), height = 0.18) +
+  geom_point(size = 2.4, color = "#2166AC") +
+  facet_wrap(~outcome, scales = "free_x") +
+  labs(x = "Coefficient on lottery luck (10 percentage-point selection-rate surprise)", y = NULL)
+
+print(coefficient_plot)
+```
+
+## Interpretation and next steps
+
+Start with the full-panel result from the core lottery-luck notebook, then use
+the table and plot here to ask whether the *point estimates* look larger or
+smaller in particular public-firm industries. Give the greatest weight to
+industries with enough firms and narrow confidence intervals. Differences in
+point estimates alone are not evidence of a causal industry difference,
+particularly where intervals overlap or industry samples are small.
+
+The next education-level heterogeneity analysis should use the same next-year
+participation outcomes and lottery-luck definition, state clearly that degree
+data describe approved petitions rather than all lottery applicants, and avoid
+claiming degree-specific causal effects without degree-specific lottery
+variation.

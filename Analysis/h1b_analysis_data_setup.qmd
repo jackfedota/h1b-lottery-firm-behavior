@@ -1,0 +1,365 @@
+---
+title: "H-1B Lottery Analysis: Reproducible Data Setup"
+subtitle: "Shared preparation of firm-year, participation, education, sector, and productivity panels"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This is the shared data-preparation file for the next phase of the project. It creates analysis-ready local files from the two source files already stored in this project:
+
+- `h1bdataset_new.csv`: one H-1B lottery registration per row.
+- `compustat_raw_2019_2023.xlsx`: Compustat firm-year accounts.
+
+The primary output is an H-1B **firm-lottery-year** panel. It contains the lottery-luck and next-year participation variables, measures of approved petitions by education, and—where an EIN links to Compustat—sector and firm-productivity variables. No download is required to rebuild it.
+
+The notebook saves the following files under `data/`:
+
+- `h1b_firm_year_analysis.rds`: preferred analysis file; preserves types.
+- `h1b_firm_year_analysis.csv`: portable version for inspection or use outside R.
+- `h1b_lottery_participation_panel.rds`: panel with next-year participation outcomes.
+- `h1b_lottery_year_rates.csv`: year-level lottery probabilities used to define luck.
+
+## Scope and interpretation
+
+The lottery source identifies firms through employer EINs. The education field is generally observed only after selection/petition processing, not for the full pool of non-selected registrations. For that reason, education variables in this dataset are explicitly labelled as **approved-petition** counts and shares. They support descriptive worker-composition heterogeneity; they do not create degree-specific lottery shocks.
+
+Compustat covers public firms only. Therefore, `sector`, sales per employee, and the TFP-style residual are missing for H-1B firms that do not link to Compustat. Sector-specific productivity analysis must be described as applying to the matched public-firm sample, whereas the lottery and participation analysis uses the full H-1B employer panel.
+
+## Packages and paths
+
+```{r}
+library(dplyr)
+library(readr)
+library(readxl)
+library(stringr)
+library(tidyr)
+
+options(dplyr.summarise.inform = FALSE)
+
+raw_h1b_path <- "h1bdataset_new.csv"
+raw_compustat_path <- "compustat_raw_2019_2023.xlsx"
+# Rendered from the project root, save the shared files in `data/`; rendered
+# from this file's own directory, save them beside this notebook.
+derived_dir <- if (dir.exists("data")) "data" else "."
+dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(raw_h1b_path), file.exists(raw_compustat_path))
+
+clean_ein <- function(x) {
+  x <- str_replace_all(as.character(x), "[^0-9]", "")
+  x <- str_replace(x, "^0+", "")
+  na_if(x, "")
+}
+
+clean_character <- function(x) {
+  x |>
+    as.character() |>
+    str_squish() |>
+    na_if("")
+}
+
+safe_divide <- function(numerator, denominator) {
+  if_else(!is.na(denominator) & denominator > 0, numerator / denominator, NA_real_)
+}
+
+first_non_missing <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA_character_ else x[[1]]
+}
+
+naics_sector <- function(naics) {
+  code <- str_sub(str_replace_all(as.character(naics), "[^0-9]", ""), 1, 2)
+  case_when(
+    code == "11" ~ "Agriculture",
+    code == "21" ~ "Mining, Oil, and Gas",
+    code == "22" ~ "Utilities",
+    code == "23" ~ "Construction",
+    code %in% c("31", "32", "33") ~ "Manufacturing",
+    code == "42" ~ "Wholesale Trade",
+    code %in% c("44", "45") ~ "Retail Trade",
+    code %in% c("48", "49") ~ "Transportation and Warehousing",
+    code == "51" ~ "Information",
+    code == "52" ~ "Finance and Insurance",
+    code == "53" ~ "Real Estate",
+    code == "54" ~ "Professional and Technical Services",
+    code == "55" ~ "Management of Companies",
+    code == "56" ~ "Administrative and Waste Services",
+    code == "61" ~ "Education",
+    code == "62" ~ "Health Care",
+    code == "71" ~ "Arts and Recreation",
+    code == "72" ~ "Accommodation and Food",
+    code == "81" ~ "Other Services",
+    code == "92" ~ "Public Administration",
+    TRUE ~ "Unknown"
+  )
+}
+```
+
+## Build the H-1B firm-lottery-year panel
+
+The estimation sample uses the standard registration statuses: `CREATED` in FY2021 and `ELIGIBLE` in later years, plus `SELECTED`. This excludes non-registration administrative records. `selection_shock` is actual selections less expected selections, where expectations use the national selection rate in the same lottery year.
+
+```{r}
+h1b_registration <- read_csv(
+  raw_h1b_path,
+  col_types = cols(.default = col_character()),
+  col_select = c(
+    fein, employer_name, lottery_year, status_type, first_decision,
+    ben_multi_reg_ind, ed_level_definition
+  ),
+  na = c("", "NA"),
+  show_col_types = FALSE
+) |>
+  transmute(
+    ein = clean_ein(fein),
+    employer_name = clean_character(employer_name),
+    lottery_year = parse_integer(lottery_year),
+    status_type = clean_character(status_type),
+    first_decision = clean_character(first_decision),
+    selected = status_type == "SELECTED",
+    # Most non-selected registrations have no petition decision. Treat the
+    # absent decision as no approval so that firm-level approval counts are 0.
+    approved = coalesce(first_decision == "Approved", FALSE),
+    multiple_registration = case_when(
+      ben_multi_reg_ind == "1" ~ TRUE,
+      ben_multi_reg_ind == "0" ~ FALSE,
+      TRUE ~ NA
+    ),
+    education_raw = clean_character(ed_level_definition),
+    degree_group = case_when(
+      education_raw == "DOCTORATE DEGREE" ~ "Doctorate",
+      education_raw == "MASTER'S DEGREE" ~ "Master's",
+      education_raw == "BACHELOR'S DEGREE" ~ "Bachelor's",
+      is.na(education_raw) ~ "Missing degree",
+      TRUE ~ "Other degree"
+    )
+  ) |>
+  filter(
+    !is.na(ein),
+    !is.na(lottery_year),
+    status_type %in% c("CREATED", "ELIGIBLE", "SELECTED")
+  )
+
+lottery_year_rates <- h1b_registration |>
+  group_by(lottery_year) |>
+  summarise(
+    year_registrations = n(),
+    year_selected = sum(selected),
+    year_selection_rate = year_selected / year_registrations,
+    .groups = "drop"
+  )
+
+h1b_firm_year <- h1b_registration |>
+  group_by(ein, lottery_year) |>
+  summarise(
+    employer_name = first_non_missing(employer_name),
+    n_registrations = n(),
+    n_selected = sum(selected),
+    n_approved = sum(approved),
+    n_approved_bachelors = sum(approved & degree_group == "Bachelor's"),
+    n_approved_masters = sum(approved & degree_group == "Master's"),
+    n_approved_doctorate = sum(approved & degree_group == "Doctorate"),
+    n_approved_other_degree = sum(approved & degree_group == "Other degree"),
+    n_approved_missing_degree = sum(approved & degree_group == "Missing degree"),
+    multiple_registration_share = if_else(
+      all(is.na(multiple_registration)),
+      NA_real_,
+      mean(multiple_registration, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) |>
+  left_join(lottery_year_rates, by = "lottery_year") |>
+  mutate(
+    expected_selected = n_registrations * year_selection_rate,
+    selection_shock = n_selected - expected_selected,
+    selection_rate = safe_divide(n_selected, n_registrations),
+    selection_luck = safe_divide(selection_shock, n_registrations),
+    selection_luck_10pp = selection_luck / 0.10,
+    approval_rate_selected = safe_divide(n_approved, n_selected),
+    approved_masters_share = safe_divide(n_approved_masters, n_approved),
+    approved_doctorate_share = safe_divide(n_approved_doctorate, n_approved),
+    approved_bachelors_share = safe_divide(n_approved_bachelors, n_approved)
+  )
+```
+
+## Add next-year lottery participation outcomes
+
+Absence from the next year's file is treated as zero registrations. The final observed lottery year is excluded because a next-year outcome is not yet available.
+
+```{r}
+next_year_registrations <- h1b_firm_year |>
+  transmute(
+    ein,
+    lottery_year = lottery_year - 1L,
+    next_year_registrations = n_registrations
+  )
+
+lottery_participation_panel <- h1b_firm_year |>
+  filter(lottery_year < max(lottery_year_rates$lottery_year)) |>
+  left_join(next_year_registrations, by = c("ein", "lottery_year")) |>
+  mutate(
+    next_year_registrations = replace_na(next_year_registrations, 0L),
+    returns_next_year = as.integer(next_year_registrations > 0),
+    log_current_registrations = log1p(n_registrations),
+    log_next_year_registrations = log1p(next_year_registrations)
+  )
+```
+
+## Add Compustat sector and productivity measures
+
+Compustat reports sales in millions of dollars and employees in thousands, so `sales_per_employee_thousands` is in thousands of dollars per employee. The TFP-style measure is a residual from a descriptive production-function regression; it is included as a prepared outcome, not a causal estimate.
+
+```{r}
+compustat <- read_excel(raw_compustat_path) |>
+  transmute(
+    ein = clean_ein(`Employer Identification Number`),
+    gvkey = clean_character(`Global Company Key`),
+    fyear = as.integer(`Data Year - Fiscal`),
+    company_name = clean_character(`Company Name`),
+    naics = clean_character(`North American Industry Classification Code`),
+    sector = naics_sector(`North American Industry Classification Code`),
+    employees_thousands = as.numeric(Employees),
+    sales_millions = as.numeric(`Sales/Turnover (Net)`),
+    operating_income_millions = as.numeric(`Operating Income Before Depreciation`),
+    capital_millions = as.numeric(`Property, Plant and Equipment - Total (Gross)`)
+  ) |>
+  filter(!is.na(ein), !is.na(fyear)) |>
+  mutate(
+    row_priority = coalesce(employees_thousands, 0) +
+      coalesce(sales_millions, 0) / 1000000
+  ) |>
+  arrange(ein, fyear, desc(row_priority)) |>
+  group_by(ein, fyear) |>
+  slice(1) |>
+  ungroup() |>
+  select(-row_priority) |>
+  mutate(
+    sales_per_employee_thousands = safe_divide(sales_millions, employees_thousands),
+    operating_income_per_employee_thousands = safe_divide(
+      operating_income_millions, employees_thousands
+    )
+  )
+
+tfp_training_data <- compustat |>
+  mutate(compustat_row_id = row_number()) |>
+  filter(
+    sales_millions > 0,
+    employees_thousands > 0,
+    capital_millions > 0,
+    sector != "Unknown"
+  ) |>
+  mutate(
+    log_sales = log(sales_millions),
+    log_employees = log(employees_thousands),
+    log_capital = log(capital_millions)
+  )
+
+tfp_model <- lm(
+  log_sales ~ log_employees + log_capital + factor(fyear) + factor(sector),
+  data = tfp_training_data
+)
+
+compustat <- compustat |>
+  mutate(compustat_row_id = row_number()) |>
+  left_join(
+    tfp_training_data |>
+      transmute(compustat_row_id, tfp_residual_proxy = residuals(tfp_model)),
+    by = "compustat_row_id"
+  ) |>
+  select(-compustat_row_id)
+
+h1b_firm_year_analysis <- h1b_firm_year |>
+  left_join(compustat, by = c("ein", "lottery_year" = "fyear")) |>
+  left_join(
+    compustat |>
+      transmute(
+        ein,
+        lottery_year = fyear - 1L,
+        employees_thousands_next = employees_thousands,
+        sales_per_employee_thousands_next = sales_per_employee_thousands,
+        tfp_residual_proxy_next = tfp_residual_proxy
+      ),
+    by = c("ein", "lottery_year")
+  ) |>
+  mutate(
+    compustat_ein_match = !is.na(gvkey),
+    registrations_per_1000_employees = 1000 * safe_divide(n_registrations, employees_thousands),
+    selected_per_1000_employees = 1000 * safe_divide(n_selected, employees_thousands),
+    approved_per_1000_employees = 1000 * safe_divide(n_approved, employees_thousands),
+    selection_shock_per_1000_employees = 1000 * safe_divide(selection_shock, employees_thousands),
+    sales_per_employee_growth_next = if_else(
+      sales_per_employee_thousands > 0 & sales_per_employee_thousands_next > 0,
+      log(sales_per_employee_thousands_next) - log(sales_per_employee_thousands),
+      NA_real_
+    ),
+    tfp_residual_change_next = tfp_residual_proxy_next - tfp_residual_proxy
+  )
+```
+
+## Save and verify the shared local files
+
+```{r}
+saveRDS(
+  h1b_firm_year_analysis,
+  file.path(derived_dir, "h1b_firm_year_analysis.rds")
+)
+write_csv(
+  h1b_firm_year_analysis,
+  file.path(derived_dir, "h1b_firm_year_analysis.csv")
+)
+saveRDS(
+  lottery_participation_panel,
+  file.path(derived_dir, "h1b_lottery_participation_panel.rds")
+)
+write_csv(
+  lottery_year_rates,
+  file.path(derived_dir, "h1b_lottery_year_rates.csv")
+)
+
+stopifnot(
+  file.exists(file.path(derived_dir, "h1b_firm_year_analysis.rds")),
+  file.exists(file.path(derived_dir, "h1b_lottery_participation_panel.rds"))
+)
+
+tibble(
+  dataset = c(
+    "H-1B firm-lottery-year analysis panel",
+    "Lottery next-year participation panel",
+    "Lottery-year selection-rate file"
+  ),
+  rows = c(
+    nrow(h1b_firm_year_analysis),
+    nrow(lottery_participation_panel),
+    nrow(lottery_year_rates)
+  ),
+  firms = c(
+    n_distinct(h1b_firm_year_analysis$ein),
+    n_distinct(lottery_participation_panel$ein),
+    NA_integer_
+  )
+) |>
+  knitr::kable()
+```
+
+## Variables for the next analysis files
+
+| Question | Main variables | Important sample restriction |
+|---|---|---|
+| Lottery luck and later participation | `selection_luck_10pp`, `next_year_registrations`, `returns_next_year` | Use `h1b_lottery_participation_panel`; cluster by `ein`. |
+| Firm heterogeneity by sector | `sector`, `selection_shock`, `approved_per_1000_employees` | Restrict to `compustat_ein_match` and a non-`Unknown` sector. |
+| Worker-composition heterogeneity | `n_approved_bachelors`, `n_approved_masters`, `n_approved_doctorate` and their shares | Associational unless a degree-specific source of lottery variation is constructed. |
+| Why firms may benefit | `sales_per_employee_growth_next`, `tfp_residual_change_next` | Public firms linked to Compustat; outcomes are firm-level, not domestic-worker outcomes. |
+
+The next modeling notebook should read the `.rds` file rather than reconstructing these variables:
+
+```{r eval=FALSE}
+panel <- readRDS("data/h1b_firm_year_analysis.rds")
+participation <- readRDS("data/h1b_lottery_participation_panel.rds")
+```

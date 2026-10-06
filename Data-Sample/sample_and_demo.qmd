@@ -1,0 +1,150 @@
+---
+title: "H-1B Data Sample and Analysis Demo"
+author: Jack Fedota
+format: html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+The full H-1B datasets used in this research are not included in this repository due to restrictions associated with our access to the data.
+
+This document creates a small sample of the processed firm-year panel for demonstration purposes and shows how the main variables and analysis workflow are structured.
+
+The results produced from this sample are illustrative only and are not the reported research results from the full dataset.
+
+## Load packages
+
+```{r}
+# Load
+library(tidyverse)    
+library(kableExtra)
+
+```
+
+
+
+## Data sampling (My use only)
+
+```{r, eval=FALSE}
+
+
+# Load full data
+
+h1b_dat_full <- read_csv("../../h1bdataset_new.csv")
+
+
+panel_dat <- readRDS("../data/h1b_lottery_participation_panel.rds")
+
+
+```
+
+
+## Sample original data (my use only)
+
+
+```{r, eval=FALSE}
+# Code
+
+set.seed(2026)
+
+h1b_dat_sample <- h1b_dat_full |>
+  slice_sample(n = 25) 
+
+write_csv(
+  h1b_dat_sample,
+  "h1b_raw_sample.csv"
+)
+
+```
+
+
+### Original Data Sample
+
+`h1b_raw_sample.csv` contains a small 25 registration sample of the original registration-level H-1B data used in this project.
+
+The sample is provided only to illustrate the structure of the source data. It is not intended to reproduce the research results or represent the full population used in the analysis.
+
+
+## Sample panel dat (my use only)
+
+```{r, eval=FALSE}
+# Code
+
+set.seed(2026)
+
+h1b_sample_panel <- panel_dat |>
+  slice_sample(n = 100) 
+
+write_csv(h1b_sample_panel,
+  "h1b_sample_panel.csv")
+
+
+
+```
+
+
+### Processed Firm-Year Sample
+
+`h1b_sample_panel.csv` contains a small sample of the processed firm-year panel used in the econometric analysis.
+
+The panel aggregates the underlying H-1B data to the firm-by-lottery-year level and contains the variables used to study lottery outcomes and subsequent firm participation.
+
+The sample is provided for demonstration purposes only. The reported research results were estimated using the complete restricted dataset.
+
+## Panel Data Demo
+
+The following section demonstrates the structure of the processed public sample
+and gives a summary of some of the features of the data and variables of interest.
+
+
+```{r}
+# Load sample panel data 
+
+h1b_sample_panel <- read_csv("h1b_sample_panel.csv")
+
+```
+
+```{r}
+# Summary Statistics Table
+
+
+h1b_sample_panel |>
+  select(
+    n_registrations,
+    n_selected,
+    selection_luck_10pp,
+    next_year_registrations,
+    returns_next_year
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  group_by(variable) |>
+  summarise(
+    N = sum(!is.na(value)),
+    Mean = mean(value, na.rm = TRUE),
+    SD = sd(value, na.rm = TRUE),
+    Median = median(value, na.rm = TRUE),
+    Min = min(value, na.rm = TRUE),
+    Max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  kable()
+
+```
+
+### Sample Summary Statistics
+
+The table above summarizes several of the primary variables used in the participation analysis. `selection_luck_10pp` measures a firm's selection-rate surprise in 10-percentage-point units, while `next_year_registrations` and `returns_next_year` capture subsequent lottery participation.
+
+These statistics describe only the small public sample provided in this repository and should not be interpreted as representative statistics for the complete research dataset.
+
+
+
+

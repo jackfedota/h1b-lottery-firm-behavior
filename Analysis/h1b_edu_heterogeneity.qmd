@@ -1,0 +1,232 @@
+---
+title: "h1b-edu-analysis"
+format: 
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+# Packages/data
+
+```{r}
+# Load
+
+library(tidyverse)
+library(kableExtra)
+library(fixest)
+library(broom)
+
+h1b_panel_dat <- readRDS("data/h1b_lottery_participation_panel.rds")
+
+
+```
+
+
+
+# Check education distributions
+
+```{r}
+# Code
+
+h1b_panel_dat |>
+  filter(n_approved > 0) |>
+  summarise(
+    any_bachelors = sum(n_approved_bachelors > 0, na.rm = TRUE),
+    pct_any_bachelors = mean(n_approved_bachelors > 0, na.rm = TRUE) * 100,
+    
+    any_masters = sum(n_approved_masters > 0, na.rm = TRUE),
+    pct_any_masters = mean(n_approved_masters > 0, na.rm = TRUE) * 100,
+    
+    any_doctorate = sum(n_approved_doctorate > 0, na.rm = TRUE),
+    pct_any_doctorate = mean(n_approved_doctorate > 0, na.rm = TRUE) * 100
+  ) |> 
+  kable()
+
+# Visual
+
+h1b_panel_dat |>
+  filter(n_approved > 0) |>
+  ggplot(aes(x = approved_doctorate_share)) +
+  geom_histogram(bins = 20) +
+  labs(
+    title = "Distribution of Approved Doctorate Share",
+    x = "Doctorate Share",
+    y = "Firm-Year Observations"
+  )
+
+```
+
+
+# Create the education-analysis data
+
+```{r}
+# Code
+
+education_dat <- h1b_panel_dat |>
+  filter(
+    !is.na(log_next_year_registrations),
+    !is.na(selection_luck_10pp),
+    !is.na(log_current_registrations),
+    n_approved > 0
+  )
+
+
+```
+
+
+# Re-run baseline model with new data
+
+```{r}
+# Code
+edu_baseline <- feols(
+  log_next_year_registrations ~
+    selection_luck_10pp +
+    log_current_registrations |
+    lottery_year,
+  data = education_dat,
+  cluster = ~ein
+)
+
+summary(edu_baseline)
+
+
+
+```
+
+# Run the three continuous-share interaction models
+
+```{r}
+
+# Bachelor's model
+
+edu_bachelors <- feols(
+  log_next_year_registrations ~
+    selection_luck_10pp * approved_bachelors_share +
+    log_current_registrations |
+    lottery_year,
+  data = education_dat,
+  cluster = ~ein
+)
+
+
+# Master's model
+
+edu_masters <- feols(
+  log_next_year_registrations ~
+    selection_luck_10pp * approved_masters_share +
+    log_current_registrations |
+    lottery_year,
+  data = education_dat,
+  cluster = ~ein
+)
+
+
+# Doctorate model
+
+edu_doctorate <- feols(
+  log_next_year_registrations ~
+    selection_luck_10pp * approved_doctorate_share +
+    log_current_registrations |
+    lottery_year,
+  data = education_dat,
+  cluster = ~ein
+)
+
+
+etable(
+  edu_baseline,
+  edu_bachelors,
+  edu_masters,
+  edu_doctorate
+)
+
+
+```
+
+# Plot results
+
+```{r}
+# Extract the education heterogeneity coefficients from each model.
+# The interaction term measures whether the effect of lottery luck on
+# next-year registrations changes with the share of approved beneficiaries
+# at each education level.
+# Construct 95% confidence intervals for use in the coefficient plot.
+
+education_model_results <- bind_rows(
+  tidy(edu_bachelors) |>
+    filter(term == "selection_luck_10pp:approved_bachelors_share") |>
+    mutate(education = "Bachelor's"),
+
+  tidy(edu_masters) |>
+    filter(term == "selection_luck_10pp:approved_masters_share") |>
+    mutate(education = "Master's"),
+
+  tidy(edu_doctorate) |>
+    filter(term == "selection_luck_10pp:approved_doctorate_share") |>
+    mutate(education = "Doctorate")
+) |>
+  mutate(
+    conf_low = estimate - 1.96 * std.error,
+    conf_high = estimate + 1.96 * std.error
+  )
+
+# Plot the estimated education heterogeneity effects with 95% confidence intervals.
+# Points represent the lottery-luck × education-share interaction coefficients.
+# The dashed vertical line at zero represents no difference in the lottery-luck
+# effect as the approved education share changes.
+
+education_coefficient_plot <- ggplot(
+  education_model_results,
+  aes(x = estimate, y = reorder(education, estimate))
+) +
+  geom_vline(
+    xintercept = 0,
+    color = "gold",
+    linetype = "dashed",
+    linewidth = 0.9
+  ) +
+  geom_errorbarh(
+    aes(xmin = conf_low, xmax = conf_high),
+    height = 0.18,
+    linewidth = 1.2,
+    color = "#154734"
+  ) +
+  geom_point(
+    size = 4.5,
+    color = "#154734"
+  ) +
+  labs(
+    x = "Change in log next year registrations",
+    y = NULL,
+    title = "Lottery-Luck Effects by Education Level"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      size = 17,
+      face = "bold"
+    ),
+    axis.title.x = element_text(
+      size = 13
+    ),
+    axis.text.x = element_text(
+      size = 12
+    ),
+    axis.text.y = element_text(
+      size = 13
+    ),
+    panel.grid.minor = element_blank()
+  )
+
+print(education_coefficient_plot)
+```
+
+# Interpretation
+
+The effect of lottery luck on firms’ subsequent H-1B participation varies significantly with the education composition of approved beneficiaries. A higher master’s-degree share is associated with a stronger negative relationship between lottery luck and next-year registrations, while higher bachelor’s- and doctorate-degree shares are associated with a weaker negative relationship. The doctorate interaction is the largest positive interaction, although its confidence interval is wider due to the relatively small number of firms with doctorate-level approvals. Overall, these results provide evidence that firms’ responses to lottery luck differ according to the education composition of the workers they successfully obtain. These findings apply to firms with at least one approved beneficiary, since education is not observed for firms with zero approvals.
+

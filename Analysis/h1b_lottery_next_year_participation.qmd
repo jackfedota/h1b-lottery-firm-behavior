@@ -1,0 +1,122 @@
+---
+title: "H-1B Lottery Luck and Next-Year Firm Participation"
+subtitle: "Baseline firm-level analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+## Question and approach
+
+This notebook asks whether firms with better-than-expected H-1B lottery outcomes submit more or fewer registrations in the following lottery year. It is the baseline analysis for the industry-heterogeneity notebook.
+
+The unit of observation is an employer EIN in a lottery year. Lottery luck is the firm's selection-rate surprise relative to that year's national selection rate, measured in 10-percentage-point units (`selection_luck_10pp`). The analysis uses the full H-1B employer participation panel; it is not restricted to Compustat-matched public firms.
+
+Two next-year outcomes capture different margins of participation:
+
+- `log(1 + next_year_registrations)`: whether firms file more or fewer registrations, while retaining firms with zero filings next year.
+- `returns_next_year`: whether firms file at least one registration next year.
+
+The log outcome reduces the influence of very large filers. Its coefficient is an approximate proportional change in `1 +` next-year registrations, not a raw count change. The return indicator provides a complementary extensive-margin estimate.
+
+## Load the saved participation panel
+
+```{r}
+#| label: load-data
+
+library(dplyr)
+library(fixest)
+library(broom)
+library(knitr)
+
+participation_path <- file.path("data", "h1b_lottery_participation_panel.rds")
+stopifnot(file.exists(participation_path))
+participation <- readRDS(participation_path)
+
+required_variables <- c(
+  "ein", "lottery_year", "n_registrations", "selection_luck_10pp",
+  "next_year_registrations", "returns_next_year",
+  "log_current_registrations", "log_next_year_registrations"
+)
+stopifnot(all(required_variables %in% names(participation)))
+```
+
+## Descriptive sample summary
+
+```{r}
+#| label: descriptive-summary
+
+participation |>
+  summarise(
+    firm_years = n(), firms = n_distinct(ein),
+    current_registrations = sum(n_registrations),
+    next_year_registrations = sum(next_year_registrations),
+    return_rate = mean(returns_next_year),
+    mean_lottery_luck_10pp = mean(selection_luck_10pp)
+  ) |>
+  mutate(return_rate = scales::percent(return_rate, accuracy = 0.1)) |>
+  kable(caption = "Full H-1B employer participation panel")
+```
+
+## Lottery luck and next-year participation
+
+For each outcome, estimate:
+
+\[
+Y_{i,t+1} = \beta\,\text{lottery luck}_{it} +
+\gamma\log(1 + \text{current registrations}_{it}) +
+\text{lottery-year fixed effects} + e_{it}.
+\]
+
+Lottery-year fixed effects account for annual changes in the national H-1B registration environment. Standard errors are clustered by firm EIN. The control for current registrations compares firms with similar current filing scale.
+
+```{r}
+#| label: estimate-baseline-models
+
+outcomes <- c(
+  log_next_year_registrations = "Log(1 + next-year registrations)",
+  returns_next_year = "Returns to lottery next year"
+)
+
+estimate_participation_model <- function(outcome_name, outcome_label) {
+  model_data <- participation |>
+    filter(!is.na(.data[[outcome_name]]), !is.na(selection_luck_10pp),
+      !is.na(log_current_registrations))
+  model <- feols(
+    as.formula(paste0(outcome_name,
+      " ~ selection_luck_10pp + log_current_registrations | lottery_year")),
+    data = model_data, cluster = ~ein
+  )
+  luck_term <- tidy(model) |> filter(term == "selection_luck_10pp")
+  tibble(
+    outcome = outcome_label, firm_years = nobs(model),
+    firms = n_distinct(model_data$ein),
+    luck_coefficient = luck_term$estimate, std_error = luck_term$std.error,
+    conf_low = luck_term$estimate - 1.96 * luck_term$std.error,
+    conf_high = luck_term$estimate + 1.96 * luck_term$std.error,
+    p_value = luck_term$p.value
+  )
+}
+
+baseline_results <- bind_rows(lapply(names(outcomes), function(outcome_name) {
+  estimate_participation_model(outcome_name, outcomes[[outcome_name]])
+}))
+
+baseline_results |>
+  mutate(
+    across(c(luck_coefficient, std_error, conf_low, conf_high), ~ round(.x, 3)),
+    p_value = signif(p_value, 3)
+  ) |>
+  kable(caption = "Lottery luck and next-year H-1B participation")
+```
+
+## Interpretation
+
+For the log-registration outcome, a positive coefficient means that a luckier lottery year is associated with a proportional increase in `1 +` next-year registrations; a negative coefficient means a proportional decrease. For the return outcome, the coefficient is a change in the probability of filing at least one registration next year.
+
+The industry notebook, `h1b_sector_heterogeneity.qmd`, applies the same specification separately by industry in the Compustat-matched public-firm subset. Compare those exploratory industry estimates with this full-panel baseline before drawing conclusions about heterogeneous responses.
